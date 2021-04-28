@@ -18,12 +18,43 @@
 
 namespace async{
 
+    class exception : public std::exception {
+        public:
+        exception(const char* msg) : msg(msg) {}
+        virtual const char* what() const noexcept 
+            { return msg; }
+        protected:
+        const char* msg;
+    };
+
+    class DanglingPromise : public exception {
+        public:
+        DanglingPromise() : exception(
+"All promises must be awaited, and/or stored correctly until they are satisfied. Do not allow Promise objects to become temporaries unawaited."
+            ) {}
+    };
+
+    /**
+     * The Promise class designates a future location for the return value of a coroutine.
+     * A Promise will designate one object of type T.
+     * If a Promise is expecting to be fullfilled, do NOT allow it to be a temporary or it will become
+     * a dangling promise and an error will be thrown.
+     */
     template<typename T>
     class _Promise{
 
         public:
+        /**
+         * maybeT represents an object that might contain T, or not.
+         */
         typedef std::optional<T> maybeT;
+        /**
+         * ThenType represents a function that can be called once the Promise is satisfied.
+         */
         typedef std::function< maybeT (T&)> Thentype;
+        /**
+         * The type a Promise is meant to hold.
+         */
         typedef T type; 
         _Promise() = default; 
         _Promise(const _Promise<T>& other) : element(other.element), thenfn(other.thenfn) { set = (bool)other.set; };
@@ -72,7 +103,7 @@ namespace async{
     };
 
     template<typename T>
-    using Promise = std::unique_ptr<_Promise<T > >; 
+    using Promise = std::shared_ptr<_Promise<T > >; 
 
     template<typename T> 
     class Queue{
@@ -144,15 +175,24 @@ namespace async{
         [[nodiscard]] Promise<T> execute( std::function<T ()> coroutine) 
             {
                 _Promise<T> out;
-                Promise<T> ptr = std::make_unique<_Promise<T> >(out);
+                Promise<T> ptr = std::make_shared<_Promise<T> >(out);
+                std::weak_ptr<_Promise<T> > weak = ptr;
                 if (activeThreads == threadpool.size()) // if all threads are occupied
                 {
                     threadpool.push_back(std::thread( worker_mainloop, task_handle, this ));
                     worker_count++;
                 }
                 task_handle->enqueue( 
-                    [coroutine, &ptr](){ 
-                        ptr->assign(coroutine());
+                    [coroutine, weak](){ 
+
+                        auto v = coroutine();
+                        // Check to ensure that the promise is still waiting on the other end
+                        if (weak.expired()){
+                            // Throw if not
+                            throw DanglingPromise();
+                        }
+                        // Assign the value now that the promise is confirmed to exist
+                        weak.lock()->assign(v);
                     }
                 );
                 return ptr;
@@ -202,20 +242,29 @@ namespace async{
         
         template<class InputIterator, typename Function> 
         //TODO Fix std::invokable for lambda/funs
-            requires std::input_iterator<InputIterator> && std::invocable<Function>
-        [[nodiscard]] Promise<size_t> to_each(EventLoop& e, InputIterator begin, InputIterator end, Function fn){
+            requires std::input_iterator<InputIterator>
+        [[nodiscard]] Promise<bool> to_each(EventLoop& e, InputIterator begin, InputIterator end, Function fn){
             
-            std::for_each(begin, end-1, [&e,fn, begin, end](auto& i){
-                e.execute(
-                    [&](){
-                        std::invoke(fn, i);
-                    }
+            std::vector<Promise<bool> > promises;
+            promises.reserve(end-begin);
+
+            std::for_each(begin, end, [&e,fn, begin, end, &promises](auto& i){
+                promises.push_back(
+                    (e.execute(
+                        [&](){
+                            fn(i);
+                        }
+                    ))
                 );
-            
             
             });
 
-            return e.execute( [=](){ std::invoke(fn, *end); } );
+            return e.execute( [=](){ 
+                for (auto& p : promises ) {
+                    p->await();
+                    }
+                } 
+            );
 
         }
 
