@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <iterator>
 #include <concepts>
+#include <unordered_map>
 
 namespace async{
 
@@ -155,6 +156,8 @@ namespace async{
         { 
             std::lock_guard<std::mutex> lock(mut);
             base.emplace(x); 
+            fulltex.notify_one();
+
         }
         /**
          * Get the number queue elements.
@@ -182,6 +185,9 @@ namespace async{
             std::lock_guard<std::mutex> lock(mut);
             auto out = base.front();
             base.pop();
+            if (base.empty()){
+                fulllock.try_lock();
+            }
             return out;
         }
         /**
@@ -195,16 +201,46 @@ namespace async{
                 auto out =  base.front();
                 base.pop();
                 return out;
+            }else{
+                fulllock.try_lock();
             }
 
             return std::nullopt;
         }
 
+        std::optional<T> waitget(){
+            std::unique_lock<std::mutex> lock(fulllock);
+            fulltex.wait_for( lock, std::chrono::milliseconds(10) ,[this](){ return !this->empty(); } );
+            return safeget();
+        }
+
         private:
         std::queue<T> base;
         mutable std::mutex mut;
+        mutable std::mutex fulllock;
+        std::condition_variable fulltex;
     };
 
+    /**
+     * A Coroutine object is able to store a 'function call'
+     * with any parameters, of any type.
+     * A Coroutine object cannot store a return type, so for situations
+     * that require a returned value, run your functions through the EventLoop class'
+     * templated execute() functions.
+     */
+    class Coroutine{
+        public:
+        std::function<void()> fn = nullptr;
+        
+        /**
+         * Apply some function with some arguments to this coroutine
+         */
+        template<typename FunctionType, typename ...Args>
+        void setfn(FunctionType&& newfn, Args ... args){
+            fn = [=]() -> void { newfn(args...); };
+        }
+
+    };
     
 
 
@@ -244,12 +280,7 @@ namespace async{
 
         EventLoop(const EventLoop& other) = delete;
         ~EventLoop(){
-            isActive = false;
-            for(auto& t: threadpool){
-                t.join();
-            }
-            threadpool.clear();
-
+            join();
         }
 
         /**
@@ -259,7 +290,7 @@ namespace async{
         void join(){
             isActive = false;
             for(auto& t: threadpool){
-                t.join();
+                t.second.join();
             }
             threadpool.clear();
         }
@@ -277,16 +308,19 @@ namespace async{
                 // shrink
                 size_t difference = threadpool.size()-newsize;
                 size_t deletables = difference;
-                for (;difference;difference--){
-                    auto disposable = execute(ThreadTerminator::terminate);
+                for (;difference!=-1;difference--){
+                    launch(ThreadTerminator::terminate);
                 }
                 
-                while (threadDeleter.size() != deletables){
+                while (threadDeleter.size() < deletables){
+
+                }
+                while(threadDeleter.size()){
                     auto id = threadDeleter.safeget();
                     if (id){
-                        for (size_t i = 0 ; i < threadpool.size() ; i++){
-                            
-                        }
+                        auto iter = threadpool.find(*id);
+                        iter->second.join();
+                        threadpool.erase(iter);
                     }
                 }
 
@@ -298,6 +332,13 @@ namespace async{
                 growThreads(newsize-threadpool.size());
             }
 
+        }
+
+        void checkup(){
+            if (activeThreads == threadpool.size()) // if all threads are occupied
+            {
+                growThreads(1);
+            }
         }
 
         /**
@@ -318,10 +359,7 @@ namespace async{
                 _Promise<T> out;
                 Promise<T> ptr = std::make_shared<_Promise<T> >(out);
                 std::weak_ptr<_Promise<T> > weak = ptr;
-                if (activeThreads == threadpool.size()) // if all threads are occupied
-                {
-                    growThreads(1);
-                }
+                checkup();
                 task_handle->enqueue( 
                     [coroutine, weak](){ 
 
@@ -351,16 +389,47 @@ namespace async{
          */
         template<typename FunctionType, typename ...Args>
         [[nodiscard]] Promise<bool> execute( FunctionType&& coroutine, Args&& ...args )
-            { return execute<bool>( [=](){ coroutine(args...); return true;} ); }
+            { return execute<bool>( [=](){ std::invoke( coroutine, args... ); return true;} ); }
 
-        
-        
+        /**
+         * Execute a coroutine through this EventLoop.
+         * Note: The given coroutine will be ran in a different thread.
+         * @param coroutine a coroutine to be ran asynchronously
+         * @returns A Promise set the return value of your coroutine.
+         * Note: Do NOT allow this promise to go out of scope before the completion
+         * of your coroutine. If the promise does not exist when the coroutine
+         * finishes, it will result in undefined behavior. To prevent this,
+         * make sure you use some blocking function on your promises before they go out of scope.
+         * For example, await(), or block_then()
+         */
+        [[nodiscard]] Promise<bool> execute( Coroutine c )
+            { return execute<bool>( [=](){ if (c.fn) c.fn(); return true;} ); }
+
+        /**
+         * Launch a detached coroutine.
+         * You will have no built-in way of knowing when this coroutine will finish,
+         * or what it did. However, you do not have to await any promises.
+         * @param c a coroutine to detach and launch
+         */ 
+        void launch( Coroutine c )
+            { checkup(); task_handle->enqueue(c.fn); }
+
+        /**
+         * Launch a detached coroutine.
+         * You will have no built-in way of knowing when this coroutine will finish,
+         * or what it did. However, you do not have to await any promises.
+         * @param coroutine a coroutine to detach and launch
+         * @param args extra args to pass to coroutine
+         */ 
+        template<typename FunctionType, typename ...Args>
+        void launch( FunctionType&& coroutine, Args&& ...args )
+            { checkup(); return task_handle->enqueue( [=](){ std::invoke( coroutine, args... ); } ); }
 
 
         private:
         threadid threadIdCounter = 0;
         size_t worker_count = 0;
-        std::vector<std::thread> threadpool;
+        std::unordered_map<threadid, std::thread> threadpool;
         task_handle_t task_handle = std::make_shared< queue_t >( queue_t() );
 
 
@@ -378,10 +447,11 @@ namespace async{
                 return; // exit thread;
             }
             std::optional<std::function<void ()>> maybeTask;
+            async::EventLoop::task_handle_t tasks;
             {
-                auto tasks = activeSignal.lock();
-                maybeTask = tasks->safeget();
+                tasks = activeSignal.lock();
             }
+            maybeTask = tasks->waitget();
             if (maybeTask) {
                 rawParent->activeThreads++;
                 
@@ -404,7 +474,8 @@ namespace async{
     void EventLoop::growThreads(size_t workers){
         worker_count += workers;
         for(size_t i = 0; i < workers; i++){
-            threadpool.push_back( std::thread(worker_mainloop, task_handle, this, threadIdCounter) );
+            threadpool[threadIdCounter] = std::thread(worker_mainloop, task_handle, this, threadIdCounter);
+            //threadpool.push_back(  );
             threadIdCounter++;
         }
     }

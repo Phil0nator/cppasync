@@ -13,13 +13,13 @@ int main(){
 
     async::EventLoop loop(20);
     loop.resize(5);
-    // auto dispose = loop.execute<int>( test );
-    // auto dispose2 = loop.execute( [](){ 
-    //     std::this_thread::sleep_for(std::chrono::seconds(10)); 
-    //     } );
+    auto dispose = loop.execute<int>( testfn );
+    auto dispose2 = loop.execute( [](){ 
+        std::this_thread::sleep_for(std::chrono::seconds(10)); 
+        } );
 
-    // std::cout << dispose->await() << std::endl;
-    // dispose2->await();
+    std::cout << dispose->await() << std::endl;
+    dispose2->await();
     std::array test{1,2,3,4,5,6,7,8,10};
     auto disposable = async::algorithm::to_each( loop, test.begin(), test.end(), [](auto& i){ 
         testfn();
@@ -35,6 +35,10 @@ int main(){
 
     disp2->await();
     
+    async::Coroutine executable;
+    executable.setfn( puts, "Hello World!" );
+    auto awaitable = loop.execute(executable);
+    async::await(awaitable);
     
     return 0;
 }
