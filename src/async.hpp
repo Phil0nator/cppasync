@@ -34,6 +34,17 @@ namespace async{
             ) {}
     };
 
+    class ThreadTerminator : public exception {
+        public:
+        ThreadTerminator() : exception(
+"This exception is used to terminate a thread from within."
+        ) {}
+        static void terminate() {
+            throw ThreadTerminator();
+        } 
+    };
+
+
     /**
      * The Promise class designates a future location for the return value of a coroutine.
      * A Promise will designate one object of type T.
@@ -48,16 +59,13 @@ namespace async{
          * maybeT represents an object that might contain T, or not.
          */
         typedef std::optional<T> maybeT;
-        /**
-         * ThenType represents a function that can be called once the Promise is satisfied.
-         */
-        typedef std::function< maybeT (T&)> Thentype;
+        
         /**
          * The type a Promise is meant to hold.
          */
         typedef T type; 
         _Promise() = default; 
-        _Promise(const _Promise<T>& other) : element(other.element), thenfn(other.thenfn) { set = (bool)other.set; };
+        _Promise(const _Promise<T>& other) : element(other.element) { set = (bool)other.set; };
         ~_Promise() = default;
         /**
          * await() will block the thread until this promise is fulfilled.
@@ -66,11 +74,21 @@ namespace async{
         T& await()
             { while(!set){} return **element; }
         /**
-         * 
+         * block_then will block the thread until the promise is fulfilled,
+         * then call your given callback with the result.
+         * @param fn The function to call when finished
+         * @param args other arguments to pass into your function
+         * @returns the value returned by your callback;
          */
-        maybeT block_then( Thentype fn ) 
-            {  return fn(await()); }
+        template<typename F, typename ...Args>
+        maybeT block_then( F fn, Args&& ... args ) 
+            {  return fn(await(), args...); }
         
+        /**
+         * wait_for will await this promise for a given number of milliseconds.
+         * @param ms number of milliseconds to wait.
+         * @returns Either the result of the promise, or std::nullopt if it times out
+         */
         maybeT wait_for(std::chrono::milliseconds ms)
         { 
             auto now = std::chrono::system_clock::now();
@@ -79,6 +97,9 @@ namespace async{
             else return std::nullopt;
         }
         
+        /**
+         * (Internal use)
+         */
         void assign(maybeT value)
         { 
             if(element.get() == nullptr){
@@ -88,8 +109,11 @@ namespace async{
             }
             set = true; 
         }
-
-        bool done(){
+        /**
+         * Check if this promise is fulfilled.
+         * @returns true if this promise is fulfilled, else flase
+         */
+        bool done() const noexcept {
             return set;
         }
 
@@ -99,12 +123,23 @@ namespace async{
         private:
         std::shared_ptr<maybeT> element ;
         std::atomic<bool> set = false;
-        std::optional<Thentype> thenfn = std::nullopt;
     };
 
+    /**
+     * The Promise class designates a future location for the return value of a coroutine.
+     * A Promise will designate one object of type T.
+     * If a Promise is expecting to be fullfilled, do NOT allow it to be a temporary or it will become
+     * a dangling promise and an error will be thrown.
+     */
     template<typename T>
     using Promise = std::shared_ptr<_Promise<T > >; 
 
+
+    
+    /**
+     * The Queue class is a wrapper for the std::queue container
+     * that provides atomic thread safety. 
+     */
     template<typename T> 
     class Queue{
         public:
@@ -112,27 +147,48 @@ namespace async{
         Queue() = default;
         Queue(const Queue& q) : base(q.base) {};
         Queue(size_t size) : base(size) {}
-
+        /**
+         * Add x to the queue
+         * @param x a value to add
+         */
         void enqueue(const T& x) 
         { 
             std::lock_guard<std::mutex> lock(mut);
             base.emplace(x); 
         }
-
+        /**
+         * Get the number queue elements.
+         * @return the number of queue elements
+         */
+        size_t size(){
+            std::lock_guard<std::mutex> lock(mut);
+            return base.size();
+        }
+        /**
+         * Determine if the queue is empty.
+         * @return if the queue is empty
+         */
         bool empty()
         {
             std::lock_guard<std::mutex> lock(mut);
             bool out = base.empty();
             return out;
         }
-
+        /**
+         * Remove the last element from the queue
+         * @return the element removed
+         */
         auto dequeue(){
             std::lock_guard<std::mutex> lock(mut);
             auto out = base.front();
             base.pop();
             return out;
         }
-
+        /**
+         * Safely get the last element of the queue,
+         * or an std::nullopt if none is available.
+         * @return the last element, or std::nullopt
+         */
         std::optional<T> safeget(){
             std::lock_guard<std::mutex> lock(mut);
             if(!base.empty()){
@@ -150,17 +206,40 @@ namespace async{
     };
 
     
+
+
+    /**
+     * The EventLoop class is responsible for managing a threadpool, and any given
+     * tasks and promises.
+     * 
+     * An EventLoop can be initialized with a certain number of workers to start, but the
+     * EventLoop will add more if the workload begins to exceed the ability of existing workers.
+     * To reduce the number of workers in an EventLoop, there is a EventLoop::resize(size_t) function
+     * which will allow you to safely reset the number of workers.
+     * In order to safely wait for the EventLoop to finish all of its tasks, use EventLoop::join().
+     * For EventLoops created for temporary use, EventLoop::join is called by the destructor so there is no need
+     * to call it.
+     */
     class EventLoop{
 
         public:
+
+        
+        typedef std::shared_ptr< Queue< std::function<void (void)> > > task_handle_t;
+        typedef task_handle_t::weak_type weak_task_t;
+        typedef Queue<task_handle_t::element_type::element_t> queue_t;
+        typedef size_t threadid;
+
+        Queue<threadid> threadDeleter;
         std::atomic<size_t> activeThreads;
         std::atomic<bool> isActive = true;
+        /**
+         * Create an event loop with a certain number of initial workers.
+         * @param workers the number of threads to create initially.
+         */
         EventLoop(size_t workers = 4)
         {   
-            worker_count = workers;
-            for(size_t i = 0; i < worker_count; i++){
-                threadpool.push_back( std::thread( worker_mainloop, task_handle, this ) );
-            }
+            growThreads(workers);
         }
 
         EventLoop(const EventLoop& other) = delete;
@@ -169,18 +248,79 @@ namespace async{
             for(auto& t: threadpool){
                 t.join();
             }
-        
+            threadpool.clear();
+
         }
+
+        /**
+         * Safely close all workers and await their completion.
+         * Once an EventLoop is 'joined' it cannot be used again. 
+         */
+        void join(){
+            isActive = false;
+            for(auto& t: threadpool){
+                t.join();
+            }
+            threadpool.clear();
+        }
+
+        /**
+         * Safely reset the number of threads. If the number given is
+         * less than the current number of threads, threads will be safely
+         * closed until the given number remains. If the number given is greater than the
+         * current number of threads, more will be added.
+         * @param newsize the number of threads that should be running in this EventLoop
+         */
+        void resize(size_t newsize){
+            if (newsize == threadpool.size()) return;
+            if (newsize < threadpool.size()) {
+                // shrink
+                size_t difference = threadpool.size()-newsize;
+                size_t deletables = difference;
+                for (;difference;difference--){
+                    auto disposable = execute(ThreadTerminator::terminate);
+                }
+                
+                while (threadDeleter.size() != deletables){
+                    auto id = threadDeleter.safeget();
+                    if (id){
+                        for (size_t i = 0 ; i < threadpool.size() ; i++){
+                            
+                        }
+                    }
+                }
+
+                
+
+
+            }else{
+                // grow
+                growThreads(newsize-threadpool.size());
+            }
+
+        }
+
+        /**
+         * Execute a coroutine through this EventLoop.
+         * Note: The given coroutine will be ran in a different thread.
+         * @param coroutine a coroutine to be ran asynchronously
+         * @returns A Promise set the return value of your coroutine.
+         * Note: Do NOT allow this promise to go out of scope before the completion
+         * of your coroutine. If the promise does not exist when the coroutine
+         * finishes, it will result in undefined behavior. To prevent this,
+         * make sure you use some blocking function on your promises before they go out of scope.
+         * For example, await(), or block_then()
+         */
         template<typename T>
         [[nodiscard]] Promise<T> execute( std::function<T ()> coroutine) 
             {
+                assert(isActive);
                 _Promise<T> out;
                 Promise<T> ptr = std::make_shared<_Promise<T> >(out);
                 std::weak_ptr<_Promise<T> > weak = ptr;
                 if (activeThreads == threadpool.size()) // if all threads are occupied
                 {
-                    threadpool.push_back(std::thread( worker_mainloop, task_handle, this ));
-                    worker_count++;
+                    growThreads(1);
                 }
                 task_handle->enqueue( 
                     [coroutine, weak](){ 
@@ -197,51 +337,85 @@ namespace async{
                 );
                 return ptr;
             }
-        [[nodiscard]] Promise<bool> execute( std::function<void(void)> coroutine )
-            { return execute<bool>( [=](){ coroutine(); return true;} ); }
+        /**
+         * Execute a coroutine through this EventLoop.
+         * Note: The given coroutine will be ran in a different thread.
+         * @param coroutine a coroutine to be ran asynchronously
+         * @param args more arguments to given to your coroutine
+         * @returns A Promise set the return value of your coroutine.
+         * Note: Do NOT allow this promise to go out of scope before the completion
+         * of your coroutine. If the promise does not exist when the coroutine
+         * finishes, it will result in undefined behavior. To prevent this,
+         * make sure you use some blocking function on your promises before they go out of scope.
+         * For example, await(), or block_then()
+         */
+        template<typename FunctionType, typename ...Args>
+        [[nodiscard]] Promise<bool> execute( FunctionType&& coroutine, Args&& ...args )
+            { return execute<bool>( [=](){ coroutine(args...); return true;} ); }
 
         
         
 
 
         private:
-        typedef std::shared_ptr< Queue< std::function<void (void)> > > task_handle_t;
-        typedef task_handle_t::weak_type weak_task_t;
-        typedef Queue<task_handle_t::element_type::element_t> queue_t;
-        size_t worker_count = 4;
+        threadid threadIdCounter = 0;
+        size_t worker_count = 0;
         std::vector<std::thread> threadpool;
-
         task_handle_t task_handle = std::make_shared< queue_t >( queue_t() );
 
 
-        static void worker_mainloop(weak_task_t activeSignal, EventLoop* rawParent){
-            while(!activeSignal.expired()){
-                if (rawParent->isActive == false){
-                    exit(0); // exit thread;
-                }
-                std::optional<std::function<void ()>> maybeTask;
-                {
-                    auto tasks = activeSignal.lock();
-                    maybeTask = tasks->safeget();
-                }
-                if (maybeTask) {
-                    rawParent->activeThreads++;
-                    (*maybeTask)();
-                    rawParent->activeThreads--;
-                }
-                std::this_thread::sleep_for( std::chrono::milliseconds(1) );
-            }
-        }
+        
+
+        void growThreads(size_t workers);
 
        
 
     };
 
+    static void worker_mainloop(std::weak_ptr< Queue< std::function<void (void)> > > activeSignal, EventLoop* rawParent, EventLoop::threadid id){
+        while(!activeSignal.expired()){
+            if (rawParent->isActive == false){
+                return; // exit thread;
+            }
+            std::optional<std::function<void ()>> maybeTask;
+            {
+                auto tasks = activeSignal.lock();
+                maybeTask = tasks->safeget();
+            }
+            if (maybeTask) {
+                rawParent->activeThreads++;
+                
+                try{
+                    (*maybeTask)();
+                } catch ( const ThreadTerminator& t ){
+                    rawParent->activeThreads--;
+                    rawParent->threadDeleter.enqueue(id);
+                    return; // Terminated thread
+                }
+                
+                
+                rawParent->activeThreads--;
+            }
+
+            std::this_thread::yield();
+        }
+    }
+
+    void EventLoop::growThreads(size_t workers){
+        worker_count += workers;
+        for(size_t i = 0; i < workers; i++){
+            threadpool.push_back( std::thread(worker_mainloop, task_handle, this, threadIdCounter) );
+            threadIdCounter++;
+        }
+    }
+
+    template<typename T>
+    T& await(Promise<T> p) 
+        { return p->await(); }
 
     namespace algorithm{
         
         template<class InputIterator, typename Function> 
-        //TODO Fix std::invokable for lambda/funs
             requires std::input_iterator<InputIterator>
         [[nodiscard]] Promise<bool> to_each(EventLoop& e, InputIterator begin, InputIterator end, Function fn){
             
