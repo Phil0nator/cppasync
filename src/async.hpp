@@ -269,11 +269,12 @@ namespace async{
         Queue<threadid> threadDeleter;
         std::atomic<size_t> activeThreads;
         std::atomic<bool> isActive = true;
+        size_t max_threads = std::thread::hardware_concurrency();
         /**
          * Create an event loop with a certain number of initial workers.
          * @param workers the number of threads to create initially.
          */
-        EventLoop(size_t workers = 4)
+        EventLoop(size_t workers = 2)
         {   
             growThreads(workers);
         }
@@ -328,6 +329,9 @@ namespace async{
 
 
             }else{
+                if (newsize > max_threads){
+                    max_threads = newsize;
+                }
                 // grow
                 growThreads(newsize-threadpool.size());
             }
@@ -337,7 +341,8 @@ namespace async{
         void checkup(){
             if (activeThreads == threadpool.size()) // if all threads are occupied
             {
-                growThreads(1);
+                if (threadpool.size() < max_threads) // if more threads are allowed by the user
+                    growThreads(1);
             }
         }
 
@@ -483,6 +488,7 @@ namespace async{
     template<typename T>
     T& await(Promise<T> p) 
         { return p->await(); }
+    
 
     namespace algorithm{
         
