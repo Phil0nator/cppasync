@@ -263,6 +263,14 @@ namespace async{
         void setfn(FunctionType&& newfn, Args ... args){
             fn = [=]() -> void { newfn(args...); };
         }
+        Coroutine() = default;
+        Coroutine(const Coroutine& other) = default;
+        Coroutine(Coroutine&& other) = default;
+        Coroutine(std::function<void()> f) 
+            : fn(f) {}
+        
+        void operator()()
+            { fn(); }
 
     };
     
@@ -404,6 +412,22 @@ namespace async{
                 );
                 return ptr;
             }
+        
+
+        /**
+         * Execute a coroutine through this EventLoop.
+         * Note: The given coroutine will be ran in a different thread.
+         * @param fn a coroutine to be ran asynchronously
+         * @returns A Promise that will satisfy when your coroutine finishes.
+         * Note: Do NOT allow this promise to go out of scope before the completion
+         * of your coroutine. If the promise does not exist when the coroutine
+         * finishes, it will result in undefined behavior. To prevent this,
+         * make sure you use some blocking function on your promises before they go out of scope.
+         * For example, await(), or block_then()
+         */
+        [[nodiscard]] Promise<bool> execute ( std::function<void()> fn )
+            { return execute(Coroutine(fn)); }
+
         /**
          * Execute a coroutine through this EventLoop.
          * Note: The given coroutine will be ran in a different thread.
@@ -416,9 +440,9 @@ namespace async{
          * make sure you use some blocking function on your promises before they go out of scope.
          * For example, await(), or block_then()
          */
-        template<typename FunctionType, typename ...Args>
-        [[nodiscard]] Promise<bool> execute( FunctionType&& coroutine, Args&& ...args )
-            { return execute<bool>( [=](){ std::invoke( coroutine, args... ); return true;} ); }
+        template<typename FunctionType, typename Arg1, typename ...Args>
+        [[nodiscard]] Promise<bool> execute( FunctionType&& coroutine, Arg1 arg1, Args&& ...args )
+            { return execute<bool>( [=](){ std::invoke( coroutine, arg1, args... ); return true;} ); }
 
         /**
          * Execute a coroutine through this EventLoop.
@@ -433,6 +457,29 @@ namespace async{
          */
         [[nodiscard]] Promise<bool> execute( Coroutine c )
             { return execute<bool>( [=](){ if (c.fn) c.fn(); return true;} ); }
+
+        /**
+         * Execute a series of Coroutines through this EventLoop.
+         * Note: Each of these coroutines will be ran in a different 
+         * thread than the main thread.
+         * @param cs a vector of coroutines to be ran asynchronously
+         * @returns A promise that will satisfy once ALL of the given coroutines
+         * have finished.
+         * Note: Do NOT allow this promise to go out of scope before the completion
+         * of your coroutine. If the promise does not exist when the coroutine
+         * finishes, it will result in undefined behavior. To prevent this,
+         * make sure you use some blocking function on your promises before they go out of scope.
+         * For example, await(), or block_then()
+         */
+        [[nodiscard]] Promise<bool> executes( std::vector<Coroutine> cs )
+        {
+            std::vector<Promise<bool> > promises;
+            promises.reserve(cs.size());
+            for (auto& c : cs){
+                promises.push_back(execute(c));
+            }
+            return execute( [promises](){ for (auto& p : promises) p->await(); } );
+        }
 
         /**
          * Launch a detached coroutine.
@@ -550,6 +597,5 @@ namespace async{
 
 
 
-    //EventLoop<4> mainloop;
 
 };
