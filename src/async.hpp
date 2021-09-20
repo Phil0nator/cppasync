@@ -41,12 +41,18 @@ SOFTWARE.
 #include <concepts>
 #include <unordered_map>
 
+#ifndef ASYNC_NO_INLINE
+#define ASYNCAPI inline
+#else
+#define ASYNCAPI
+#endif
+
 namespace async{
 
     class exception : public std::exception {
         public:
         exception(const char* msg) : msg(msg) {}
-        virtual const char* what() const noexcept 
+        ASYNCAPI virtual const char* what() const noexcept 
             { return msg; }
         protected:
         const char* msg;
@@ -58,13 +64,16 @@ namespace async{
 "All promises must be awaited, and/or stored correctly until they are satisfied. Do not allow Promise objects to become temporaries unawaited."
             ) {}
     };
-
+    
+    /**
+     * The ThreadTerminator exception is used to terminate a single thread
+     */
     class ThreadTerminator : public exception {
         public:
         ThreadTerminator() : exception(
 "This exception is used to terminate a thread from within."
         ) {}
-        static void terminate() {
+        ASYNCAPI static void terminate() {
             throw ThreadTerminator();
         } 
     };
@@ -97,7 +106,12 @@ namespace async{
          * @returns the value assigned to this promise;
          */
         T& await()
-            { while(!set){} return **element; }
+            { 
+                // std::unique_lock lock(waiter_mtx);
+                // waiter.wait_for(lock, std::chrono::milliseconds(10), [&]()->bool{return set;});
+                while(!set){}
+                return **element; 
+            }
         /**
          * block_then will block the thread until the promise is fulfilled,
          * then call your given callback with the result.
@@ -133,6 +147,7 @@ namespace async{
                 *element =  (value); 
             }
             set = true; 
+            waiter.notify_all();
         }
         /**
          * Check if this promise is fulfilled.
@@ -148,6 +163,9 @@ namespace async{
         private:
         std::shared_ptr<maybeT> element ;
         std::atomic<bool> set = false;
+        std::condition_variable waiter;
+        mutable std::mutex waiter_mtx; 
+        
     };
 
     /**
@@ -260,20 +278,28 @@ namespace async{
          * Apply some function with some arguments to this coroutine
          */
         template<typename FunctionType, typename ...Args>
-        void setfn(FunctionType&& newfn, Args ... args){
-            fn = [=]() -> void { newfn(args...); };
+        void setfn(FunctionType&& newfn, Args&& ... args){
+            fn = [=]() -> void { newfn( args... ); };
         }
+
         Coroutine() = default;
         Coroutine(const Coroutine& other) = default;
         Coroutine(Coroutine&& other) = default;
         Coroutine(std::function<void()> f) 
             : fn(f) {}
         
-        void operator()()
+        ASYNCAPI void operator()()
             { fn(); }
 
     };
     
+    template<typename FunctionType, typename ...Args>
+    Coroutine make_coroutine( FunctionType&& fn, Args&& ... args )
+    {
+        Coroutine out;
+        out.setfn(std::forward<FunctionType>(fn), std::forward<Args>(args)...);
+        return (out);
+    }
 
 
     /**
@@ -301,7 +327,6 @@ namespace async{
         Queue<threadid> threadDeleter;
         std::atomic<size_t> activeThreads;
         std::atomic<bool> isActive = true;
-        size_t max_threads = std::thread::hardware_concurrency();
         /**
          * Create an event loop with a certain number of initial workers.
          * @param workers the number of threads to create initially.
@@ -317,10 +342,43 @@ namespace async{
         }
 
         /**
+         * Determine the number of currently active threads in this event loop.
+         * @returns the number of threads in this event loop currently completing
+         * a coroutine
+         */
+        ASYNCAPI size_t getActiveThreads() 
+            { return activeThreads; }
+        
+        /**
+         * Get the total number of threads held by this loop
+         * @returns number of threads
+         */
+        ASYNCAPI size_t getThreadCount() 
+            { return threadpool.size(); }
+
+        /**
+         * Set the maximum number of threads that this event loop is allowed to create
+         */
+        ASYNCAPI void setThreadLimit( size_t count ) 
+            { max_threads = count; }
+
+        /**
+         * Permit this event loop to create as many threads as it needs
+         */
+        ASYNCAPI void removeThreadLimit() 
+            { max_threads = INT64_MAX; }
+
+        /**
+         * Terminate all threads not currently in use
+         */
+        ASYNCAPI void shrinkwrap() 
+            { resize(activeThreads); }
+
+        /**
          * Safely close all workers and await their completion.
          * Once an EventLoop is 'joined' it cannot be used again. 
          */
-        void join(){
+        ASYNCAPI void join(){
             isActive = false;
             for(auto& t: threadpool){
                 t.second.join();
@@ -335,13 +393,13 @@ namespace async{
          * current number of threads, more will be added.
          * @param newsize the number of threads that should be running in this EventLoop
          */
-        void resize(size_t newsize){
+        ASYNCAPI void resize(size_t newsize){
             if (newsize == threadpool.size()) return;
             if (newsize < threadpool.size()) {
                 // shrink
                 size_t difference = threadpool.size()-newsize;
                 size_t deletables = difference;
-                for (;difference!=-1;difference--){
+                for (;difference!=-1UL;difference--){
                     launch(ThreadTerminator::terminate);
                 }
                 
@@ -370,11 +428,22 @@ namespace async{
 
         }
 
-        void checkup(){
+        ASYNCAPI void checkup(){
             if (activeThreads == threadpool.size()) // if all threads are occupied
             {
                 if (threadpool.size() < max_threads) // if more threads are allowed by the user
                     growThreads(1);
+            }
+            else
+            {
+                if (activeThreads < std::thread::hardware_concurrency())
+                {
+                    resize(std::thread::hardware_concurrency());
+                }
+                else if (activeThreads <= threadpool.size()/2)
+                {
+                    resize(threadpool.size()/2);
+                }
             }
         }
 
@@ -390,7 +459,8 @@ namespace async{
          * For example, await(), or block_then()
          */
         template<typename T>
-        [[nodiscard]] Promise<T> execute( std::function<T ()> coroutine) 
+        [[nodiscard]] 
+        Promise<T> execute( std::function<T ()> coroutine) 
             {
                 assert(isActive);
                 _Promise<T> out;
@@ -425,7 +495,8 @@ namespace async{
          * make sure you use some blocking function on your promises before they go out of scope.
          * For example, await(), or block_then()
          */
-        [[nodiscard]] Promise<bool> execute ( std::function<void()> fn )
+        [[nodiscard]] 
+        ASYNCAPI Promise<bool> execute ( std::function<void()> fn )
             { return execute(Coroutine(fn)); }
 
         /**
@@ -441,8 +512,11 @@ namespace async{
          * For example, await(), or block_then()
          */
         template<typename FunctionType, typename Arg1, typename ...Args>
-        [[nodiscard]] Promise<bool> execute( FunctionType&& coroutine, Arg1 arg1, Args&& ...args )
-            { return execute<bool>( [=](){ std::invoke( coroutine, arg1, args... ); return true;} ); }
+        [[nodiscard]] 
+        Promise<bool> execute( FunctionType&& coroutine, Arg1&& arg1, Args&& ...args )
+            {
+                return execute( make_coroutine( coroutine, arg1, args... ) );
+            }
 
         /**
          * Execute a coroutine through this EventLoop.
@@ -455,8 +529,16 @@ namespace async{
          * make sure you use some blocking function on your promises before they go out of scope.
          * For example, await(), or block_then()
          */
-        [[nodiscard]] Promise<bool> execute( Coroutine c )
-            { return execute<bool>( [=](){ if (c.fn) c.fn(); return true;} ); }
+        [[nodiscard]] 
+        ASYNCAPI Promise<bool> execute( Coroutine c )
+            { 
+                return execute<bool>( 
+                    [=](){
+                        if (c.fn) c.fn(); 
+                        return true;
+                    } 
+                ); 
+            }
 
         /**
          * Execute a series of Coroutines through this EventLoop.
@@ -471,7 +553,8 @@ namespace async{
          * make sure you use some blocking function on your promises before they go out of scope.
          * For example, await(), or block_then()
          */
-        [[nodiscard]] Promise<bool> executes( std::vector<Coroutine> cs )
+        [[nodiscard]] 
+        Promise<bool> executes( std::vector<Coroutine> cs )
         {
             std::vector<Promise<bool> > promises;
             promises.reserve(cs.size());
@@ -487,7 +570,7 @@ namespace async{
          * or what it did. However, you do not have to await any promises.
          * @param c a coroutine to detach and launch
          */ 
-        void launch( Coroutine c )
+        ASYNCAPI void launch( Coroutine c )
             { checkup(); task_handle->enqueue(c.fn); }
 
         /**
@@ -499,7 +582,12 @@ namespace async{
          */ 
         template<typename FunctionType, typename ...Args>
         void launch( FunctionType&& coroutine, Args&& ...args )
-            { checkup(); return task_handle->enqueue( [=](){ std::invoke( coroutine, args... ); } ); }
+            { 
+                checkup(); 
+                task_handle->enqueue( 
+                    [=](){ std::invoke<FunctionType>( std::forward<FunctionType>(coroutine), std::forward<Args>(args)... ); } 
+                ); 
+            }
 
 
         private:
@@ -507,17 +595,18 @@ namespace async{
         size_t worker_count = 0;
         std::unordered_map<threadid, std::thread> threadpool;
         task_handle_t task_handle = std::make_shared< queue_t >( queue_t() );
-
+        size_t max_threads = std::thread::hardware_concurrency();
+        
 
         
 
-        void growThreads(size_t workers);
+        ASYNCAPI void growThreads(size_t workers);
 
        
 
     };
 
-    static void worker_mainloop(std::weak_ptr< Queue< std::function<void (void)> > > activeSignal, EventLoop* rawParent, EventLoop::threadid id){
+    ASYNCAPI static void worker_mainloop(std::weak_ptr< Queue< std::function<void (void)> > > activeSignal, EventLoop* rawParent, EventLoop::threadid id){
         while(!activeSignal.expired()){
             if (rawParent->isActive == false){
                 return; // exit thread;
@@ -547,7 +636,7 @@ namespace async{
         }
     }
 
-    void EventLoop::growThreads(size_t workers){
+    ASYNCAPI void EventLoop::growThreads(size_t workers){
         worker_count += workers;
         for(size_t i = 0; i < workers; i++){
             threadpool[threadIdCounter] = std::thread(worker_mainloop, task_handle, this, threadIdCounter);
@@ -563,9 +652,18 @@ namespace async{
 
     namespace algorithm{
         
+        /**
+         * Apply the function 'fn' to each item between 'begin' and 'end' asynchronously on eventloop 'e'.
+         * @param e the event loop to run on
+         * @param begin begin input iterator
+         * @param end end input iterator
+         * @param fn a function to call
+         * @returns a promise which will complete once all tasks complete
+         */
         template<class InputIterator, typename Function> 
             requires std::input_iterator<InputIterator>
-        [[nodiscard]] Promise<bool> to_each(EventLoop& e, InputIterator begin, InputIterator end, Function fn){
+        [[nodiscard]] 
+        Promise<bool> to_each(EventLoop& e, InputIterator begin, InputIterator end, Function fn){
             
             std::vector<Promise<bool> > promises;
             promises.reserve(end-begin);
@@ -591,11 +689,78 @@ namespace async{
         }
 
 
+        /**
+         * Apply function 'fn' to each number between 'start' and 'stop' incrementing by 'step' on
+         * eventloop 'e'.
+         * @param e the event loop to execute on
+         * @param start the first number
+         * @param stop the maximum number
+         * @param step the amount to increment by
+         * @param fn the function to apply to each number
+         * @returns a promise that completes once all the numbers have executed
+         */
+        template< 
+            typename RangeTypeA, 
+            typename RangeTypeB, 
+            typename RangeTypeC, 
+            typename FunctionType
+            >
+        [[nodiscard]]
+        Promise<bool> to_each_range( EventLoop& e, RangeTypeA start, RangeTypeB stop, RangeTypeC step, FunctionType fn )
+        {
+            std::vector< Promise<bool> > promises;
+            promises.reserve((size_t)(stop-start)/step);
+
+            for ( RangeTypeC i = start; i < stop; i+=step )
+            {
+                promises.push_back(
+                    e.execute( fn, i )
+                );
+            }
+
+            return e.execute( [=](){
+                    for (auto& p:promises)
+                    {
+                        p->await();
+                    }
+                } 
+            );
+        }
+
+
+        /**
+         * Execute coroutine 'b' asyncronously after 'a' completes on eventloop 'e'
+         * @param e eventloop to run on
+         * @param a first event
+         * @param b second event
+         * @returns a promise that will complete once 'b' finishes
+         */
+        template< typename T, typename FunctionType >
+        [[nodiscard]]
+        Promise<bool> then( EventLoop& e, Promise<T>&& a, FunctionType&& b )
+        {
+            return e.execute(
+                [=](){ a->await(); b(); }
+            );
+        }
+
+        /**
+         * Execute coroutine 'b' asyncronously after 'a' completes on eventloop 'e'
+         * @param e eventloop to run on
+         * @param a first event
+         * @param b second event
+         * @returns none
+         */
+        template< typename T, typename FunctionType >
+        void then_launch( EventLoop& e, Promise<T>&& a, FunctionType&& b )
+        {
+            return e.launch(
+                [=](){ a->await(); b(); }
+            );
+        }
+
     }
 
 
 
-
-
-
-};
+}
