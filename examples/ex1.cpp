@@ -4,7 +4,7 @@
 
 int main() {
 
-    async::EventLoop loop{3};
+    async::EventLoop loop{std::thread::hardware_concurrency()};
 
     loop.run([](){
         printf("Hello World! (1)\n");

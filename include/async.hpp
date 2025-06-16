@@ -5,12 +5,10 @@
 #include <mutex>
 #include <condition_variable>
 #include <future>
-#include <iostream>
-#include <list>
 #include <vector>
 #include <stdexcept>
 #include <set>
-#include <optional>
+#include <compare>
 
 namespace async {
 
@@ -161,6 +159,13 @@ namespace async {
          */
         T get();
 
+        /**
+         * @brief Yield to the event loop until 
+         * 
+         * @return T the value given to this future
+         */
+        T yield_until_ready();
+
         private:
         EventLoop* loop;
         std::weak_ptr<Promise<T>> promise;
@@ -223,11 +228,12 @@ namespace async {
             Timer(TimePoint d, std::function<void()> t);
             Timer(const Timer& other) = delete;
             Timer(Timer&& other) = default;
-            inline auto operator<=>(const Timer& other) const noexcept;
+            inline std::strong_ordering operator<=>(const Timer& other) const noexcept;
         };
 
         inline void start_workers(size_t num_threads);
         inline void worker_loop();
+        inline bool process_pending();
 
         std::queue<std::function<void()>> tasks;
         std::set<Timer> timers;
@@ -235,6 +241,11 @@ namespace async {
         std::condition_variable condition;
         bool running;
         std::vector<std::thread> workers;
+
+
+        template<typename T>
+        friend class Future;
+
     };
 
     // Promise<T> definitions
@@ -300,27 +311,21 @@ namespace async {
     Future<T>::Future(const std::shared_ptr<Promise<T>>& p, EventLoop* loop)
         : std::future<T>(p->get_future()), promise(p), loop(loop) {}
 
+
+    // Generic then implementation
     template<typename T>
     template<typename F>
     auto Future<T>::then(F&& f) && -> Future<typename std::invoke_result<F, T>::type> {
         using ReturnType = typename std::invoke_result<F, T>::type;
         std::shared_ptr<Promise<T>> parent;
         if ((parent = promise.lock()) == nullptr) {
-            if constexpr (std::is_void<T>::value) {
-                loop->run(f);
-            } else {
-                return loop->run(f, Future<T>::get());
-            }
+            return loop->run(f, this->get());
         } 
 
         std::unique_lock lock(parent->mtx);
 
-        if (std::future<T>::wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-            if constexpr (std::is_void<T>::value) {
-                loop->run(f);
-            } else {
-                return loop->run(f, Future<T>::get());
-            }
+        if (this->wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            return loop->run(f, this->get());
         }
 
         auto np = std::make_shared<Promise<ReturnType>>(loop);
@@ -344,10 +349,69 @@ namespace async {
         return future;
     }
 
+    // Specialized void future then implementation
+    template<>
+    template<typename F>
+    auto Future<void>::then(F&& f) && -> Future<typename std::invoke_result<F, void>::type> {
+        using ReturnType = typename std::invoke_result<F, void>::type;
+        std::shared_ptr<Promise<void>> parent;
+        if ((parent = promise.lock()) == nullptr) {
+            this->get();
+            return loop->run(f);
+        } 
+
+        std::unique_lock lock(parent->mtx);
+
+        if (this->wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            this->get();
+            return loop->run(f);
+        }
+
+        auto np = std::make_shared<Promise<ReturnType>>(loop);
+        Future<ReturnType> future(np, loop);
+        auto chain = [self=this->share(), np, f = std::forward<F>(f)]() mutable {
+            try {
+                if constexpr (std::is_void<ReturnType>::value) {
+                    f();
+                    np->set_value();
+                } else {
+                    np->set_value(f(self.get()));
+                }
+            } catch (...) {
+                np->set_exception(std::current_exception());
+            }
+        };
+
+        parent->chain = std::move(chain);
+
+        return future;
+    }
+
     template<typename T>
     T Future<T>::get() {
         this->promise.reset();
         return std::future<T>::get();
+    }
+
+    template <typename T>
+    inline T Future<T>::yield_until_ready()
+    {
+        while (std::future<T>::wait_for(std::chrono::milliseconds(1)) != std::future_status::ready) {
+            if (!loop->process_pending()) {
+                std::this_thread::yield();
+            }
+        }
+        return get();
+    }
+
+    template<>
+    inline void Future<void>::yield_until_ready() {
+        while (std::future<void>::wait_for(std::chrono::milliseconds(1)) != std::future_status::ready) {
+            if (!loop->process_pending()) {
+                std::this_thread::yield();
+            }
+        }
+        get();
     }
 
     // EventLoop definitions
@@ -437,7 +501,7 @@ namespace async {
 
     EventLoop::Timer::Timer(TimePoint d, std::function<void()> t) : deadline(d), task(std::move(t)) {}
 
-    inline auto EventLoop::Timer::operator<=>(const Timer& other) const noexcept {
+    inline std::strong_ordering EventLoop::Timer::operator<=>(const Timer& other) const noexcept {
         return deadline <=> other.deadline;
     }
 
@@ -488,4 +552,28 @@ namespace async {
         }
     }
 
+    inline bool EventLoop::process_pending()
+    {
+        std::function<void()> task;
+        bool has_task = false;
+        auto now = Clock::now();
+
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!timers.empty() && timers.begin()->deadline <= now) {
+                task = std::move(timers.extract(timers.begin()).value().task);
+                has_task = true;
+            } else if (!tasks.empty()) {
+                task = std::move(tasks.front());
+                tasks.pop();
+                has_task = true;
+            }
+        }
+
+        if (has_task) {
+            task();
+            return true;
+        }
+        return false;
+    }
 }

@@ -23,8 +23,8 @@ cppasync is licensed under the MIT license.
 
 int main() {
 
-    // Initialize an event loop with 3 threads (arbitrary number)
-    async::EventLoop loop{3};
+    // Initialize an event loop with hardware thread count
+    async::EventLoop loop{std::thread::hardware_concurrency()};
 
     // Run this task as soon as possible
     loop.run([](){
@@ -63,3 +63,44 @@ int main() {
 }
 ```
 
+# Example for less threads
+
+```C++
+#include "async.hpp"
+
+/**
+ * A slow task that can hold up the event loop
+ */
+async::Future<void> slow_task(async::EventLoop& loop) {
+    return loop.run([](){
+        for(size_t i = 0; i < 1000; i++) {
+            if (i % 100 == 0) printf("%d\n", i);
+        }
+    });
+}
+
+
+int main() {
+
+    async::EventLoop loop{1};
+
+    // Run some tasks
+    loop.run([&loop](){
+        
+        // Queue a couple of slow tasks
+        auto task_a = slow_task(loop);
+        auto task_b = slow_task(loop);
+
+        // yield this task to execute the other
+        // slow tasks. This is necessary because
+        // the event loop has only one thread,
+        // and a call to .get() would block the
+        // only thread available to complete the
+        // slow tasks
+        task_a.yield_until_ready();
+        task_b.yield_until_ready();
+    }).get();
+
+    return 0;
+}
+```
