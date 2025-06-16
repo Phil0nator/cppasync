@@ -4,19 +4,21 @@
 
 int main() {
 
+    
     async::EventLoop loop{std::thread::hardware_concurrency()};
+    async::default_loop(&loop);
 
-    loop.run([](){
+    async::run([](){
         printf("Hello World! (1)\n");
         return 5;
     });
 
-    loop.run([](){
+    async::run([](){
         printf("Hello World! (2)\n");
     });
 
 
-    auto test = loop.run_later(1000, [](){
+    auto test = async::run_later(1000, [](){
         printf("Hello World! (3)\n");
         return 5;
     }).then([](int a){

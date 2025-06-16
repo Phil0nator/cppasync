@@ -248,6 +248,16 @@ namespace async {
 
     };
 
+    namespace {
+        inline EventLoop* _default_loop;
+    }
+
+    inline void default_loop(EventLoop* loop)
+        { _default_loop = loop; }
+
+    inline EventLoop* default_loop()
+        { return _default_loop; }
+
     // Promise<T> definitions
     template<typename T>
     Promise<T>::Promise(EventLoop* lp) : std::promise<T>(), lp(lp) {}
@@ -429,6 +439,10 @@ namespace async {
                 worker.join();
             }
         }
+        // ensure default_loop is never invalid
+        if (default_loop() == this) {
+            default_loop(nullptr);
+        }
     }
 
     void EventLoop::stop() {
@@ -576,4 +590,37 @@ namespace async {
         }
         return false;
     }
+
+
+
+    /**
+     * @brief Run a task asynchronously, returning a value or exception with a std::future
+     *  (Operates on the global default event loop)
+     * 
+     * @tparam F Invokable type to run
+     * @tparam Args types of arguments provided to the invokable
+     * @param f Invokable object to run
+     * @param args Arguments provided to f
+     * @return std::future return value or exception 
+     */
+    template<typename F, typename... Args>
+    auto run(F&& f, Args&&... args) -> Future<typename std::invoke_result<F, Args...>::type> 
+        { return default_loop()->run(f, args...); }
+
+    /**
+     * @brief Schedule a task to run after some delay
+     *  (Operates on the global default event loop)
+     * 
+     * @tparam F Invokable type to run
+     * @tparam Args Argument types for F
+     * @param delay_ms delay in milliseconds
+     * @param f Invokable object to run
+     * @param args Arguments for f
+     * @return std::future return value or exception
+     */
+    template<typename F, typename... Args>
+    auto run_later(int delay_ms, F&& f, Args&&... args) -> Future<typename std::invoke_result<F, Args...>::type> 
+        { return default_loop()->run_later(delay_ms, f, args...); }
+
+
 }
