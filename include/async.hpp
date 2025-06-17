@@ -265,7 +265,8 @@ namespace async {
     template<typename T>
     void Promise<T>::invoke_chain() {
         if (chain) {
-            lp->run(chain);
+            // lp->run(chain);
+            chain();
         }
     }
 
@@ -301,7 +302,8 @@ namespace async {
 
     void Promise<void>::invoke_chain() {
         if (chain) {
-            lp->run(chain);
+            // lp->run(chain);
+            chain();
         }
     }
 
